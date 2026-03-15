@@ -1,12 +1,12 @@
-# Omi Agent Relay
+# Agent Relay
 
-Cross-instance agent messaging relay for the Omi team. Enables agents running on different OpenClaw instances to communicate in real-time.
+Cross-instance agent messaging relay. Connect agents running on different OpenClaw instances in real-time via WebSocket or HTTP.
 
 ## Concepts
 
 - **instanceId** — unique identifier per OpenClaw install
-- **teamId** — shared namespace (e.g. `omi-team`)
-- **topics** — optional pub/sub routing (e.g. `dev.alerts`, `deploys`)
+- **teamId** — shared namespace for a group of instances
+- **topics** — optional pub/sub routing (e.g. `alerts`, `deploys`)
 
 ## Endpoints
 
@@ -25,18 +25,18 @@ All endpoints (except `/health`) require a Bearer token matching `TEAM_TOKEN`.
 
 ### Connect
 ```
-ws://host/ws?teamId=omi-team&instanceId=my-instance&token=<TEAM_TOKEN>
+ws://host/ws?teamId=my-team&instanceId=my-instance&token=<TEAM_TOKEN>
 ```
 
 ### Subscribe to topics
 ```json
-{ "type": "subscribe", "topics": ["dev.alerts", "deploys"] }
+{ "type": "subscribe", "topics": ["alerts", "deploys"] }
 ```
 
 ### Send a message
 ```json
 { "type": "message", "message": "hello", "to": "instance-2" }
-{ "type": "message", "message": "alert!", "topic": "dev.alerts" }
+{ "type": "message", "message": "alert!", "topic": "alerts" }
 { "type": "message", "message": "broadcast to all" }
 ```
 
@@ -59,7 +59,8 @@ ws://host/ws?teamId=omi-team&instanceId=my-instance&token=<TEAM_TOKEN>
 |----------|----------|-------------|
 | `PORT` | No | Server port (default: 3000) |
 | `TEAM_TOKEN` | Yes | Shared auth token |
+| `REDIS_URL` | No | Redis URL for multi-replica pub/sub |
 
 ## Deploy
 
-Deployed on Railway in the Omi team workspace.
+One-click deploy on Railway, or run anywhere with Node 18+.

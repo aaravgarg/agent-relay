@@ -1,7 +1,7 @@
 {
-  "name": "omi-agent-relay",
+  "name": "agent-relay",
   "version": "1.0.0",
-  "description": "Cross-instance agent messaging relay for Omi team",
+  "description": "Cross-instance agent messaging relay for OpenClaw",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
