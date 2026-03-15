@@ -7,23 +7,28 @@ const Redis = require('ioredis');
 const PORT = process.env.PORT || 3000;
 const TEAM_TOKEN = process.env.TEAM_TOKEN;
 const REDIS_URL = process.env.REDIS_URL || process.env.REDIS_PRIVATE_URL;
+const MESSAGE_TTL = 60 * 60 * 24 * 7; // 7 days
 
 if (!TEAM_TOKEN) {
   console.error('TEAM_TOKEN env var is required');
   process.exit(1);
 }
 
-// --- Redis (optional, enables multi-replica) ---
+// --- Redis ---
+let redis = null;
 let redisPub = null;
 let redisSub = null;
 const REDIS_CHANNEL = 'relay:messages';
 
 if (REDIS_URL) {
+  redis = new Redis(REDIS_URL);
   redisPub = new Redis(REDIS_URL);
   redisSub = new Redis(REDIS_URL);
 
+  redis.on('connect', () => console.log('[redis] connected'));
   redisPub.on('connect', () => console.log('[redis] pub connected'));
   redisSub.on('connect', () => console.log('[redis] sub connected'));
+  redis.on('error', (e) => console.error('[redis] error:', e.message));
   redisPub.on('error', (e) => console.error('[redis] pub error:', e.message));
   redisSub.on('error', (e) => console.error('[redis] sub error:', e.message));
 
@@ -39,6 +44,8 @@ if (REDIS_URL) {
       deliverLocal(teamId, from, envelope, payload);
     } catch {}
   });
+} else {
+  console.warn('[warn] No REDIS_URL — message queue disabled, only real-time delivery');
 }
 
 // --- Auth ---
@@ -54,9 +61,7 @@ function extractToken(req) {
 }
 
 // --- Connection Registry ---
-// Map<teamId, Map<instanceId, Set<WebSocket>>>
 const teams = new Map();
-// Map<ws, { teamId, instanceId, topics }>
 const connMeta = new Map();
 
 function getTeam(teamId) {
@@ -85,6 +90,40 @@ function unregister(ws) {
     if (team.size === 0) teams.delete(teamId);
   }
   connMeta.delete(ws);
+}
+
+// --- Message Queue (Redis) ---
+function queueKey(teamId, instanceId) {
+  return `relay:queue:${teamId}:${instanceId}`;
+}
+
+async function enqueueMessage(teamId, instanceId, payload) {
+  if (!redis) return;
+  const key = queueKey(teamId, instanceId);
+  await redis.rpush(key, payload);
+  await redis.expire(key, MESSAGE_TTL);
+}
+
+async function dequeueMessages(teamId, instanceId, limit = 100) {
+  if (!redis) return [];
+  const key = queueKey(teamId, instanceId);
+  const messages = await redis.lrange(key, 0, limit - 1);
+  if (messages.length > 0) {
+    await redis.ltrim(key, messages.length, -1);
+  }
+  return messages;
+}
+
+async function peekMessages(teamId, instanceId, limit = 100) {
+  if (!redis) return [];
+  const key = queueKey(teamId, instanceId);
+  return redis.lrange(key, 0, limit - 1);
+}
+
+async function queueLength(teamId, instanceId) {
+  if (!redis) return 0;
+  const key = queueKey(teamId, instanceId);
+  return redis.llen(key);
 }
 
 // --- Message Routing ---
@@ -124,10 +163,11 @@ function deliverLocal(teamId, from, envelope, payload) {
   return delivered;
 }
 
-function routeMessage(teamId, from, envelope) {
+async function routeMessage(teamId, from, envelope) {
   const { to, topic, message, meta } = envelope;
+  const msgId = uuidv4();
   const payload = JSON.stringify({
-    id: uuidv4(),
+    id: msgId,
     from,
     to: to || null,
     topic: topic || null,
@@ -138,12 +178,36 @@ function routeMessage(teamId, from, envelope) {
 
   const localDelivered = deliverLocal(teamId, from, envelope, payload);
 
+  // If target is offline and it's a direct message, queue it
+  if (to && localDelivered === 0 && redis) {
+    await enqueueMessage(teamId, to, payload);
+  }
+
+  // For broadcasts/topics with no listeners, queue for all known instances
+  if (!to && !topic && localDelivered === 0 && redis) {
+    // Get all known instances from Redis
+    const knownKey = `relay:known:${teamId}`;
+    const knownInstances = await redis.smembers(knownKey);
+    for (const inst of knownInstances) {
+      if (inst !== from) {
+        await enqueueMessage(teamId, inst, payload);
+      }
+    }
+  }
+
   // Publish to Redis for other replicas
   if (redisPub) {
     redisPub.publish(REDIS_CHANNEL, JSON.stringify({ teamId, from, envelope, payload })).catch(() => {});
   }
 
-  return localDelivered;
+  return { delivered: localDelivered, queued: localDelivered === 0, id: msgId };
+}
+
+// Track known instances
+async function trackInstance(teamId, instanceId) {
+  if (!redis) return;
+  const key = `relay:known:${teamId}`;
+  await redis.sadd(key, instanceId);
 }
 
 // --- Express App ---
@@ -151,17 +215,17 @@ const app = express();
 app.use(express.json());
 
 app.get('/health', (req, res) => {
-  const totalConns = connMeta.size;
-  const teamCount = teams.size;
   res.json({
     status: 'ok',
-    connections: totalConns,
-    teams: teamCount,
-    redis: !!redisPub,
+    connections: connMeta.size,
+    teams: teams.size,
+    redis: !!redis,
+    queueEnabled: !!redis,
   });
 });
 
-app.post('/publish', (req, res) => {
+// HTTP publish — now queues if target is offline
+app.post('/publish', async (req, res) => {
   const token = extractToken(req);
   if (!authenticate(token)) return res.status(401).json({ error: 'unauthorized' });
 
@@ -170,10 +234,53 @@ app.post('/publish', (req, res) => {
     return res.status(400).json({ error: 'teamId, from, and message are required' });
   }
 
-  const delivered = routeMessage(teamId, from, { to, topic, message, meta });
-  res.json({ delivered, id: uuidv4() });
+  // Track sender as known instance
+  await trackInstance(teamId, from);
+
+  const result = await routeMessage(teamId, from, { to, topic, message, meta });
+  res.json(result);
 });
 
+// Poll for queued messages (the key endpoint for async messaging)
+app.get('/messages', async (req, res) => {
+  const token = extractToken(req);
+  if (!authenticate(token)) return res.status(401).json({ error: 'unauthorized' });
+
+  const { teamId, instanceId, limit, peek } = req.query;
+  if (!teamId || !instanceId) {
+    return res.status(400).json({ error: 'teamId and instanceId query params required' });
+  }
+
+  // Track as known instance
+  await trackInstance(teamId, instanceId);
+
+  const maxMessages = Math.min(parseInt(limit) || 100, 500);
+
+  if (peek === 'true') {
+    const messages = await peekMessages(teamId, instanceId, maxMessages);
+    return res.json({ messages: messages.map(m => JSON.parse(m)), count: messages.length });
+  }
+
+  // Default: dequeue (consume)
+  const messages = await dequeueMessages(teamId, instanceId, maxMessages);
+  res.json({ messages: messages.map(m => JSON.parse(m)), count: messages.length });
+});
+
+// Check queue depth
+app.get('/messages/count', async (req, res) => {
+  const token = extractToken(req);
+  if (!authenticate(token)) return res.status(401).json({ error: 'unauthorized' });
+
+  const { teamId, instanceId } = req.query;
+  if (!teamId || !instanceId) {
+    return res.status(400).json({ error: 'teamId and instanceId query params required' });
+  }
+
+  const count = await queueLength(teamId, instanceId);
+  res.json({ count });
+});
+
+// List connected instances
 app.get('/instances', (req, res) => {
   const token = extractToken(req);
   if (!authenticate(token)) return res.status(401).json({ error: 'unauthorized' });
@@ -218,11 +325,23 @@ server.on('upgrade', (req, socket, head) => {
   });
 });
 
-wss.on('connection', (ws, { teamId, instanceId }) => {
+wss.on('connection', async (ws, { teamId, instanceId }) => {
   register(ws, teamId, instanceId);
+  await trackInstance(teamId, instanceId);
   console.log(`[+] ${instanceId} joined ${teamId} (${connMeta.size} total)`);
 
   ws.send(JSON.stringify({ type: 'connected', teamId, instanceId }));
+
+  // Deliver any queued messages on connect
+  if (redis) {
+    const queued = await dequeueMessages(teamId, instanceId);
+    for (const msg of queued) {
+      ws.send(msg);
+    }
+    if (queued.length > 0) {
+      console.log(`[>] delivered ${queued.length} queued messages to ${instanceId}`);
+    }
+  }
 
   ws.on('message', (raw) => {
     let data;
@@ -252,13 +371,14 @@ wss.on('connection', (ws, { teamId, instanceId }) => {
     }
 
     if (data.type === 'message' && data.message) {
-      const delivered = routeMessage(teamId, instanceId, {
+      routeMessage(teamId, instanceId, {
         to: data.to,
         topic: data.topic,
         message: data.message,
         meta: data.meta,
+      }).then(result => {
+        ws.send(JSON.stringify({ type: 'ack', id: data.id, ...result }));
       });
-      ws.send(JSON.stringify({ type: 'ack', id: data.id, delivered }));
       return;
     }
   });
@@ -283,5 +403,5 @@ setInterval(() => {
 }, 30000);
 
 server.listen(PORT, () => {
-  console.log(`Relay server running on port ${PORT} (redis: ${!!redisPub})`);
+  console.log(`Relay server running on port ${PORT} (redis: ${!!redis}, queue: ${!!redis})`);
 });
