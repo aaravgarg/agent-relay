@@ -151,6 +151,7 @@ async function fireWebhook(teamId, instanceId, message) {
         'Content-Length': Buffer.byteLength(payload),
       },
       timeout: WEBHOOK_TIMEOUT,
+      rejectUnauthorized: false, // Allow self-signed certs (common for OpenClaw instances)
     }, (res) => {
       let body = '';
       res.on('data', (c) => body += c);
