@@ -151,7 +151,8 @@ async function fireWebhook(teamId, instanceId, message) {
         'Content-Length': Buffer.byteLength(payload),
       },
       timeout: WEBHOOK_TIMEOUT,
-      rejectUnauthorized: false, // Allow self-signed certs (common for OpenClaw instances)
+      rejectUnauthorized: false,
+      family: 4, // Force IPv4 — many VPS have broken IPv6
     }, (res) => {
       let body = '';
       res.on('data', (c) => body += c);
@@ -162,8 +163,8 @@ async function fireWebhook(teamId, instanceId, message) {
     });
 
     req.on('error', (e) => {
-      console.error(`[webhook] ${instanceId} error: ${e.message}`);
-      resolve({ fired: false, reason: e.message });
+      console.error(`[webhook] ${instanceId} error: ${e.message || e.code || String(e)}`);
+      resolve({ fired: false, reason: e.message || e.code || String(e) });
     });
 
     req.on('timeout', () => {
