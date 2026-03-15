@@ -1,6 +1,7 @@
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const http = require('http');
+const https = require('https');
 const { v4: uuidv4 } = require('uuid');
 const Redis = require('ioredis');
 
@@ -8,6 +9,7 @@ const PORT = process.env.PORT || 3000;
 const TEAM_TOKEN = process.env.TEAM_TOKEN;
 const REDIS_URL = process.env.REDIS_URL || process.env.REDIS_PRIVATE_URL;
 const MESSAGE_TTL = 60 * 60 * 24 * 7; // 7 days
+const WEBHOOK_TIMEOUT = 10000; // 10s
 
 if (!TEAM_TOKEN) {
   console.error('TEAM_TOKEN env var is required');
@@ -45,7 +47,7 @@ if (REDIS_URL) {
     } catch {}
   });
 } else {
-  console.warn('[warn] No REDIS_URL — message queue disabled, only real-time delivery');
+  console.warn('[warn] No REDIS_URL — message queue and webhooks disabled');
 }
 
 // --- Auth ---
@@ -92,7 +94,88 @@ function unregister(ws) {
   connMeta.delete(ws);
 }
 
-// --- Message Queue (Redis) ---
+// --- Webhook Registry ---
+function webhookKey(teamId, instanceId) {
+  return `relay:webhook:${teamId}:${instanceId}`;
+}
+
+async function registerWebhook(teamId, instanceId, config) {
+  if (!redis) return;
+  await redis.set(webhookKey(teamId, instanceId), JSON.stringify(config));
+}
+
+async function getWebhook(teamId, instanceId) {
+  if (!redis) return null;
+  const raw = await redis.get(webhookKey(teamId, instanceId));
+  return raw ? JSON.parse(raw) : null;
+}
+
+async function removeWebhook(teamId, instanceId) {
+  if (!redis) return;
+  await redis.del(webhookKey(teamId, instanceId));
+}
+
+async function listWebhooks(teamId) {
+  if (!redis) return [];
+  const pattern = `relay:webhook:${teamId}:*`;
+  const keys = await redis.keys(pattern);
+  const results = [];
+  for (const key of keys) {
+    const instanceId = key.split(':').pop();
+    const raw = await redis.get(key);
+    if (raw) results.push({ instanceId, ...JSON.parse(raw) });
+  }
+  return results;
+}
+
+// --- Fire Webhook ---
+async function fireWebhook(teamId, instanceId, message) {
+  const config = await getWebhook(teamId, instanceId);
+  if (!config || !config.url) return { fired: false, reason: 'no webhook registered' };
+
+  const payload = JSON.stringify({
+    message: `[Relay message from ${message.from}]: ${message.message}`,
+    name: 'AgentRelay',
+    ...(config.agentId && { agentId: config.agentId }),
+  });
+
+  return new Promise((resolve) => {
+    const url = new URL(config.url);
+    const mod = url.protocol === 'https:' ? https : http;
+
+    const req = mod.request(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${config.token}`,
+        'Content-Length': Buffer.byteLength(payload),
+      },
+      timeout: WEBHOOK_TIMEOUT,
+    }, (res) => {
+      let body = '';
+      res.on('data', (c) => body += c);
+      res.on('end', () => {
+        console.log(`[webhook] ${instanceId}: ${res.statusCode}`);
+        resolve({ fired: true, status: res.statusCode });
+      });
+    });
+
+    req.on('error', (e) => {
+      console.error(`[webhook] ${instanceId} error: ${e.message}`);
+      resolve({ fired: false, reason: e.message });
+    });
+
+    req.on('timeout', () => {
+      req.destroy();
+      resolve({ fired: false, reason: 'timeout' });
+    });
+
+    req.write(payload);
+    req.end();
+  });
+}
+
+// --- Message Queue ---
 function queueKey(teamId, instanceId) {
   return `relay:queue:${teamId}:${instanceId}`;
 }
@@ -108,29 +191,24 @@ async function dequeueMessages(teamId, instanceId, limit = 100) {
   if (!redis) return [];
   const key = queueKey(teamId, instanceId);
   const messages = await redis.lrange(key, 0, limit - 1);
-  if (messages.length > 0) {
-    await redis.ltrim(key, messages.length, -1);
-  }
+  if (messages.length > 0) await redis.ltrim(key, messages.length, -1);
   return messages;
 }
 
 async function peekMessages(teamId, instanceId, limit = 100) {
   if (!redis) return [];
-  const key = queueKey(teamId, instanceId);
-  return redis.lrange(key, 0, limit - 1);
+  return redis.lrange(queueKey(teamId, instanceId), 0, limit - 1);
 }
 
 async function queueLength(teamId, instanceId) {
   if (!redis) return 0;
-  const key = queueKey(teamId, instanceId);
-  return redis.llen(key);
+  return redis.llen(queueKey(teamId, instanceId));
 }
 
 // --- Message Routing ---
 function deliverLocal(teamId, from, envelope, payload) {
   const team = teams.get(teamId);
   if (!team) return 0;
-
   const { to, topic } = envelope;
   let delivered = 0;
 
@@ -159,7 +237,6 @@ function deliverLocal(teamId, from, envelope, payload) {
       }
     }
   }
-
   return delivered;
 }
 
@@ -167,47 +244,45 @@ async function routeMessage(teamId, from, envelope) {
   const { to, topic, message, meta } = envelope;
   const msgId = uuidv4();
   const payload = JSON.stringify({
-    id: msgId,
-    from,
-    to: to || null,
-    topic: topic || null,
-    message,
-    meta: meta || {},
-    ts: Date.now(),
+    id: msgId, from, to: to || null, topic: topic || null,
+    message, meta: meta || {}, ts: Date.now(),
   });
 
   const localDelivered = deliverLocal(teamId, from, envelope, payload);
 
-  // If target is offline and it's a direct message, queue it
+  let queued = false;
+  let webhookResult = null;
+
   if (to && localDelivered === 0 && redis) {
+    // Target is offline — queue + fire webhook
     await enqueueMessage(teamId, to, payload);
+    queued = true;
+    webhookResult = await fireWebhook(teamId, to, { from, message, meta });
   }
 
-  // For broadcasts/topics with no listeners, queue for all known instances
   if (!to && !topic && localDelivered === 0 && redis) {
-    // Get all known instances from Redis
     const knownKey = `relay:known:${teamId}`;
     const knownInstances = await redis.smembers(knownKey);
     for (const inst of knownInstances) {
       if (inst !== from) {
         await enqueueMessage(teamId, inst, payload);
+        // Fire webhook for each offline instance
+        fireWebhook(teamId, inst, { from, message, meta }).catch(() => {});
       }
     }
+    queued = true;
   }
 
-  // Publish to Redis for other replicas
   if (redisPub) {
     redisPub.publish(REDIS_CHANNEL, JSON.stringify({ teamId, from, envelope, payload })).catch(() => {});
   }
 
-  return { delivered: localDelivered, queued: localDelivered === 0, id: msgId };
+  return { delivered: localDelivered, queued, id: msgId, webhook: webhookResult };
 }
 
-// Track known instances
 async function trackInstance(teamId, instanceId) {
   if (!redis) return;
-  const key = `relay:known:${teamId}`;
-  await redis.sadd(key, instanceId);
+  await redis.sadd(`relay:known:${teamId}`, instanceId);
 }
 
 // --- Express App ---
@@ -221,10 +296,53 @@ app.get('/health', (req, res) => {
     teams: teams.size,
     redis: !!redis,
     queueEnabled: !!redis,
+    webhooksEnabled: !!redis,
   });
 });
 
-// HTTP publish — now queues if target is offline
+// Register/update webhook for an instance
+app.put('/webhooks', async (req, res) => {
+  const token = extractToken(req);
+  if (!authenticate(token)) return res.status(401).json({ error: 'unauthorized' });
+
+  const { teamId, instanceId, url, token: webhookToken, agentId } = req.body;
+  if (!teamId || !instanceId || !url || !webhookToken) {
+    return res.status(400).json({ error: 'teamId, instanceId, url, and token are required' });
+  }
+
+  await registerWebhook(teamId, instanceId, { url, token: webhookToken, agentId });
+  await trackInstance(teamId, instanceId);
+  res.json({ ok: true, instanceId });
+});
+
+// Remove webhook
+app.delete('/webhooks', async (req, res) => {
+  const token = extractToken(req);
+  if (!authenticate(token)) return res.status(401).json({ error: 'unauthorized' });
+
+  const { teamId, instanceId } = req.body;
+  if (!teamId || !instanceId) {
+    return res.status(400).json({ error: 'teamId and instanceId are required' });
+  }
+
+  await removeWebhook(teamId, instanceId);
+  res.json({ ok: true });
+});
+
+// List webhooks for a team
+app.get('/webhooks', async (req, res) => {
+  const token = extractToken(req);
+  if (!authenticate(token)) return res.status(401).json({ error: 'unauthorized' });
+
+  const teamId = req.query.teamId;
+  if (!teamId) return res.status(400).json({ error: 'teamId query param required' });
+
+  const webhooks = await listWebhooks(teamId);
+  // Don't expose tokens
+  res.json({ webhooks: webhooks.map(w => ({ instanceId: w.instanceId, url: w.url, agentId: w.agentId })) });
+});
+
+// HTTP publish
 app.post('/publish', async (req, res) => {
   const token = extractToken(req);
   if (!authenticate(token)) return res.status(401).json({ error: 'unauthorized' });
@@ -234,14 +352,12 @@ app.post('/publish', async (req, res) => {
     return res.status(400).json({ error: 'teamId, from, and message are required' });
   }
 
-  // Track sender as known instance
   await trackInstance(teamId, from);
-
   const result = await routeMessage(teamId, from, { to, topic, message, meta });
   res.json(result);
 });
 
-// Poll for queued messages (the key endpoint for async messaging)
+// Poll inbox
 app.get('/messages', async (req, res) => {
   const token = extractToken(req);
   if (!authenticate(token)) return res.status(401).json({ error: 'unauthorized' });
@@ -251,22 +367,19 @@ app.get('/messages', async (req, res) => {
     return res.status(400).json({ error: 'teamId and instanceId query params required' });
   }
 
-  // Track as known instance
   await trackInstance(teamId, instanceId);
-
-  const maxMessages = Math.min(parseInt(limit) || 100, 500);
+  const max = Math.min(parseInt(limit) || 100, 500);
 
   if (peek === 'true') {
-    const messages = await peekMessages(teamId, instanceId, maxMessages);
+    const messages = await peekMessages(teamId, instanceId, max);
     return res.json({ messages: messages.map(m => JSON.parse(m)), count: messages.length });
   }
 
-  // Default: dequeue (consume)
-  const messages = await dequeueMessages(teamId, instanceId, maxMessages);
+  const messages = await dequeueMessages(teamId, instanceId, max);
   res.json({ messages: messages.map(m => JSON.parse(m)), count: messages.length });
 });
 
-// Check queue depth
+// Queue depth
 app.get('/messages/count', async (req, res) => {
   const token = extractToken(req);
   if (!authenticate(token)) return res.status(401).json({ error: 'unauthorized' });
@@ -298,7 +411,7 @@ app.get('/instances', (req, res) => {
   res.json({ instances });
 });
 
-// --- HTTP Server + WebSocket ---
+// --- WebSocket ---
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
@@ -332,15 +445,11 @@ wss.on('connection', async (ws, { teamId, instanceId }) => {
 
   ws.send(JSON.stringify({ type: 'connected', teamId, instanceId }));
 
-  // Deliver any queued messages on connect
+  // Auto-deliver queued messages
   if (redis) {
     const queued = await dequeueMessages(teamId, instanceId);
-    for (const msg of queued) {
-      ws.send(msg);
-    }
-    if (queued.length > 0) {
-      console.log(`[>] delivered ${queued.length} queued messages to ${instanceId}`);
-    }
+    for (const msg of queued) ws.send(msg);
+    if (queued.length > 0) console.log(`[>] delivered ${queued.length} queued msgs to ${instanceId}`);
   }
 
   ws.on('message', (raw) => {
@@ -355,7 +464,6 @@ wss.on('connection', async (ws, { teamId, instanceId }) => {
       }
       return;
     }
-
     if (data.type === 'unsubscribe' && data.topics) {
       const meta = connMeta.get(ws);
       if (meta) {
@@ -364,18 +472,13 @@ wss.on('connection', async (ws, { teamId, instanceId }) => {
       }
       return;
     }
-
     if (data.type === 'ping') {
       ws.send(JSON.stringify({ type: 'pong', ts: Date.now() }));
       return;
     }
-
     if (data.type === 'message' && data.message) {
       routeMessage(teamId, instanceId, {
-        to: data.to,
-        topic: data.topic,
-        message: data.message,
-        meta: data.meta,
+        to: data.to, topic: data.topic, message: data.message, meta: data.meta,
       }).then(result => {
         ws.send(JSON.stringify({ type: 'ack', id: data.id, ...result }));
       });
@@ -383,18 +486,11 @@ wss.on('connection', async (ws, { teamId, instanceId }) => {
     }
   });
 
-  ws.on('close', () => {
-    unregister(ws);
-    console.log(`[-] ${instanceId} left ${teamId} (${connMeta.size} total)`);
-  });
-
-  ws.on('error', (err) => {
-    console.error(`[!] ${instanceId}: ${err.message}`);
-    unregister(ws);
-  });
+  ws.on('close', () => { unregister(ws); console.log(`[-] ${instanceId} left ${teamId}`); });
+  ws.on('error', (err) => { console.error(`[!] ${instanceId}: ${err.message}`); unregister(ws); });
 });
 
-// --- Heartbeat ---
+// Heartbeat
 setInterval(() => {
   for (const [ws] of connMeta) {
     if (ws.readyState !== 1) { unregister(ws); continue; }
@@ -403,5 +499,5 @@ setInterval(() => {
 }, 30000);
 
 server.listen(PORT, () => {
-  console.log(`Relay server running on port ${PORT} (redis: ${!!redis}, queue: ${!!redis})`);
+  console.log(`Relay running on :${PORT} (redis: ${!!redis}, queue: ${!!redis}, webhooks: ${!!redis})`);
 });
