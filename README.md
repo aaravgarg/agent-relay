@@ -1,6 +1,8 @@
 # Agent Relay
 
-Cross-instance agent messaging relay. Connect agents running on different OpenClaw instances in real-time via WebSocket or HTTP.
+Cross-instance agent messaging relay. Connect agents running on different OpenClaw instances via WebSocket or HTTP. Messages are queued when recipients are offline (7-day TTL).
+
+Install the ClawHub skill: `clawhub install cross-instance-relay`
 
 ## Concepts
 
@@ -13,7 +15,9 @@ Cross-instance agent messaging relay. Connect agents running on different OpenCl
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Health check |
-| `/publish` | POST | Send a message via HTTP |
+| `/publish` | POST | Send a message (queues if offline) |
+| `/messages` | GET | Poll inbox (consume queued messages) |
+| `/messages/count` | GET | Check inbox depth |
 | `/instances` | GET | List connected instances |
 | `/ws` | WS | Real-time WebSocket connection |
 
@@ -21,26 +25,43 @@ Cross-instance agent messaging relay. Connect agents running on different OpenCl
 
 All endpoints (except `/health`) require a Bearer token matching `TEAM_TOKEN`.
 
+## HTTP API
+
+### Send a message
+```bash
+curl -X POST https://your-relay/publish \
+  -H "Authorization: Bearer $TEAM_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"teamId":"my-team","from":"instance-a","to":"instance-b","message":"hello"}'
+```
+
+Response: `{"delivered":1,"queued":false,"id":"uuid"}` or `{"delivered":0,"queued":true,"id":"uuid"}`
+
+### Poll inbox
+```bash
+curl "https://your-relay/messages?teamId=my-team&instanceId=instance-b" \
+  -H "Authorization: Bearer $TEAM_TOKEN"
+```
+
+Add `&peek=true` to read without consuming.
+
 ## WebSocket Protocol
 
 ### Connect
 ```
-ws://host/ws?teamId=my-team&instanceId=my-instance&token=<TEAM_TOKEN>
+wss://your-relay/ws?teamId=my-team&instanceId=my-instance&token=<TEAM_TOKEN>
 ```
 
-### Subscribe to topics
-```json
-{ "type": "subscribe", "topics": ["alerts", "deploys"] }
-```
+Queued messages are auto-delivered on connect.
 
-### Send a message
+### Send via WebSocket
 ```json
 { "type": "message", "message": "hello", "to": "instance-2" }
 { "type": "message", "message": "alert!", "topic": "alerts" }
 { "type": "message", "message": "broadcast to all" }
 ```
 
-### Message format (received)
+### Received message format
 ```json
 {
   "id": "uuid",
@@ -59,7 +80,7 @@ ws://host/ws?teamId=my-team&instanceId=my-instance&token=<TEAM_TOKEN>
 |----------|----------|-------------|
 | `PORT` | No | Server port (default: 3000) |
 | `TEAM_TOKEN` | Yes | Shared auth token |
-| `REDIS_URL` | No | Redis URL for multi-replica pub/sub |
+| `REDIS_URL` | Yes | Redis URL (required for message queuing) |
 
 ## Deploy
 
